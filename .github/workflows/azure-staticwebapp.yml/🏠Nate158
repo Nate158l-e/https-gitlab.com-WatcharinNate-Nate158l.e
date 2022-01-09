@@ -1,0 +1,1848 @@
+# This workflow will build and push a web application to an Azure Static Web App when you change your code.
+#
+# This workflow assumes you have already created the target Azure Static Web App.
+# For instructions see https://docs.microsoft.com/azure/static-web-apps/get-started-portal?tabs=vanilla-javascript
+#
+# To configure this workflow:
+#
+# 1. Set up a secret in your repository named AZURE_STATIC_WEB_APPS_API_TOKEN with the value of your Static Web Apps deployment token.
+#    For instructions on obtaining the deployment token see: https://docs.microsoft.com/azure/static-web-apps/deployment-token-management
+#
+# 3. Change the values for the APP_LOCATION, API_LOCATION and APP_ARTIFACT_LOCATION, AZURE_STATIC_WEB_APPS_API_TOKEN environment variables (below).
+#    For instructions on setting up the appropriate configuration values go to https://docs.microsoft.com/azure/static-web-apps/front-end-frameworks
+name: Deploy web app to Azure Static Web Apps
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+    branches:
+      - main
+# // Copyright 2016 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+ 
+// Package ethstats implements the network stats reporting service.
+package ethstats
+ 
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math/big"
+	"net"
+	"regexp"
+	"runtime"
+	"strconv"
+	"strings"
+	"time"
+ 
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/mclock"
+	"github.com/ethereum/go-ethereum/consensus"
+	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/eth"
+	"github.com/ethereum/go-ethereum/event"
+	"github.com/ethereum/go-ethereum/les"
+	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/p2p"
+	"github.com/ethereum/go-ethereum/rpc"
+	"golang.org/x/net/websocket"
+)
+ 
+const (
+	// historyUpdateRange is the number of blocks a node should report upon login or
+	// history request.
+	historyUpdateRange = 50
+ 
+	// txChanSize is the size of channel listening to NewTxsEvent.
+	// The number is referenced from the size of tx pool.
+	txChanSize = 4096
+	// chainHeadChanSize is the size of channel listening to ChainHeadEvent.
+	chainHeadChanSize = 10
+)
+ 
+type txPool interface {
+	// SubscribeNewTxsEvent should return an event subscription of
+	// NewTxsEvent and send events to the given channel.
+	SubscribeNewTxsEvent(chan<- core.NewTxsEvent) event.Subscription
+}
+ 
+type blockChain interface {
+	SubscribeChainHeadEvent(ch chan<- core.ChainHeadEvent) event.Subscription
+}
+ 
+// Service implements an Ethereum netstats reporting daemon that pushes local
+// chain statistics up to a monitoring server.
+type Service struct {
+	server *p2p.Server        // Peer-to-peer server to retrieve networking infos
+	eth    *eth.Ethereum      // Full Ethereum service if monitoring a full node
+	les    *les.LightEthereum // Light Ethereum service if monitoring a light node
+	engine consensus.Engine   // Consensus engine to retrieve variadic block fields
+ 
+	node string // Name of the node to display on the monitoring page
+	pass string // Password to authorize access to the monitoring page
+	host string // Remote address of the monitoring service
+ 
+	pongCh chan struct{} // Pong notifications are fed into this channel
+	histCh chan []uint64 // History request block numbers are fed into this channel
+}
+ 
+// New returns a monitoring service ready for stats reporting.
+func New(url string, ethServ *eth.Ethereum, lesServ *les.LightEthereum) (*Service, error) {
+	// Parse the netstats connection url
+	re := regexp.MustCompile("([^:@]*)(:([^@]*))?@(.+)")
+	parts := re.FindStringSubmatch(url)
+	if len(parts) != 5 {
+		return nil, fmt.Errorf("invalid netstats url: \"%s\", should be nodename:secret@host:port", url)
+	}
+	// Assemble and return the stats service
+	var engine consensus.Engine
+	if ethServ != nil {
+		engine = ethServ.Engine()
+	} else {
+		engine = lesServ.Engine()
+	}
+	return &Service{
+		eth:    ethServ,
+		les:    lesServ,
+		engine: engine,
+		node:   parts[1],
+		pass:   parts[3],
+		host:   parts[4],
+		pongCh: make(chan struct{}),
+		histCh: make(chan []uint64, 1),
+	}, nil
+}
+ 
+// Protocols implements node.Service, returning the P2P network protocols used
+// by the stats service (nil as it doesn't use the devp2p overlay network).
+func (s *Service) Protocols() []p2p.Protocol { return nil }
+ 
+// APIs implements node.Service, returning the RPC API endpoints provided by the
+// stats service (nil as it doesn't provide any user callable APIs).
+func (s *Service) APIs() []rpc.API { return nil }
+ 
+// Start implements node.Service, starting up the monitoring and reporting daemon.
+func (s *Service) Start(server *p2p.Server) error {
+	s.server = server
+	go s.loop()
+ 
+	log.Info("Stats daemon started")
+	return nil
+}
+ 
+// Stop implements node.Service, terminating the monitoring and reporting daemon.
+func (s *Service) Stop() error {
+	log.Info("Stats daemon stopped")
+	return nil
+}
+ 
+// loop keeps trying to connect to the netstats server, reporting chain events
+// until termination.
+func (s *Service) loop() {
+	// Subscribe to chain events to execute updates on
+	var blockchain blockChain
+	var txpool txPool
+	if s.eth != nil {
+		blockchain = s.eth.BlockChain()
+		txpool = s.eth.TxPool()
+	} else {
+		blockchain = s.les.BlockChain()
+		txpool = s.les.TxPool()
+	}
+ 
+	chainHeadCh := make(chan core.ChainHeadEvent, chainHeadChanSize)
+	headSub := blockchain.SubscribeChainHeadEvent(chainHeadCh)
+	defer headSub.Unsubscribe()
+ 
+	txEventCh := make(chan core.NewTxsEvent, txChanSize)
+	txSub := txpool.SubscribeNewTxsEvent(txEventCh)
+	defer txSub.Unsubscribe()
+ 
+	// Start a goroutine that exhausts the subsciptions to avoid events piling up
+	var (
+		quitCh = make(chan struct{})
+		headCh = make(chan *types.Block, 1)
+		txCh   = make(chan struct{}, 1)
+	)
+	go func() {
+		var lastTx mclock.AbsTime
+ 
+	HandleLoop:
+		for {
+			select {
+			// Notify of chain head events, but drop if too frequent
+			case head := <-chainHeadCh:
+				select {
+				case headCh <- head.Block:
+				default:
+				}
+ 
+			// Notify of new transaction events, but drop if too frequent
+			case <-txEventCh:
+				if time.Duration(mclock.Now()-lastTx) < time.Second {
+					continue
+				}
+				lastTx = mclock.Now()
+ 
+				select {
+				case txCh <- struct{}{}:
+				default:
+				}
+ 
+			// node stopped
+			case <-txSub.Err():
+				break HandleLoop
+			case <-headSub.Err():
+				break HandleLoop
+			}
+		}
+		close(quitCh)
+	}()
+	// Loop reporting until termination
+	for {
+		// Resolve the URL, defaulting to TLS, but falling back to none too
+		path := fmt.Sprintf("%s/api", s.host)
+		urls := []string{path}
+ 
+		if !strings.Contains(path, "://") { // url.Parse and url.IsAbs is unsuitable (https://github.com/golang/go/issues/19779)
+			urls = []string{"wss://" + path, "ws://" + path}
+		}
+		// Establish a websocket connection to the server on any supported URL
+		var (
+			conf *websocket.Config
+			conn *websocket.Conn
+			err  error
+		)
+		for _, url := range urls {
+			if conf, err = websocket.NewConfig(url, "http://localhost/"); err != nil {
+				continue
+			}
+			conf.Dialer = &net.Dialer{Timeout: 5 * time.Second}
+			if conn, err = websocket.DialConfig(conf); err == nil {
+				break
+			}
+		}
+		if err != nil {
+			log.Warn("Stats server unreachable", "err", err)
+			time.Sleep(10 * time.Second)
+			continue
+		}
+		// Authenticate the client with the server
+		if err = s.login(conn); err != nil {
+			log.Warn("Stats login failed", "err", err)
+			conn.Close()
+			time.Sleep(10 * time.Second)
+			continue
+		}
+		go s.readLoop(conn)
+ 
+		// Send the initial stats so our node looks decent from the get go
+		if err = s.report(conn); err != nil {
+			log.Warn("Initial stats report failed", "err", err)
+			conn.Close()
+			continue
+		}
+		// Keep sending status updates until the connection breaks
+		fullReport := time.NewTicker(15 * time.Second)
+ 
+		for err == nil {
+			select {
+			case <-quitCh:
+				conn.Close()
+				return
+ 
+			case <-fullReport.C:
+				if err = s.report(conn); err != nil {
+					log.Warn("Full stats report failed", "err", err)
+				}
+			case list := <-s.histCh:
+				if err = s.reportHistory(conn, list); err != nil {
+					log.Warn("Requested history report failed", "err", err)
+				}
+			case head := <-headCh:
+				if err = s.reportBlock(conn, head); err != nil {
+					log.Warn("Block stats report failed", "err", err)
+				}
+				if err = s.reportPending(conn); err != nil {
+					log.Warn("Post-block transaction stats report failed", "err", err)
+				}
+			case <-txCh:
+				if err = s.reportPending(conn); err != nil {
+					log.Warn("Transaction stats report failed", "err", err)
+				}
+			}
+		}
+		// Make sure the connection is closed
+		conn.Close()
+	}
+}
+ 
+// readLoop loops as long as the connection is alive and retrieves data packets
+// from the network socket. If any of them match an active request, it forwards
+// it, if they themselves are requests it initiates a reply, and lastly it drops
+// unknown packets.
+func (s *Service) readLoop(conn *websocket.Conn) {
+	// If the read loop exists, close the connection
+	defer conn.Close()
+ 
+	for {
+		// Retrieve the next generic network packet and bail out on error
+		var msg map[string][]interface{}
+		if err := websocket.JSON.Receive(conn, &msg); err != nil {
+			log.Warn("Failed to decode stats server message", "err", err)
+			return
+		}
+		log.Trace("Received message from stats server", "msg", msg)
+		if len(msg["emit"]) == 0 {
+			log.Warn("Stats server sent non-broadcast", "msg", msg)
+			return
+		}
+		command, ok := msg["emit"][0].(string)
+		if !ok {
+			log.Warn("Invalid stats server message type", "type", msg["emit"][0])
+			return
+		}
+		// If the message is a ping reply, deliver (someone must be listening!)
+		if len(msg["emit"]) == 2 && command == "node-pong" {
+			select {
+			case s.pongCh <- struct{}{}:
+				// Pong delivered, continue listening
+				continue
+			default:
+				// Ping routine dead, abort
+				log.Warn("Stats server pinger seems to have died")
+				return
+			}
+		}
+		// If the message is a history request, forward to the event processor
+		if len(msg["emit"]) == 2 && command == "history" {
+			// Make sure the request is valid and doesn't crash us
+			request, ok := msg["emit"][1].(map[string]interface{})
+			if !ok {
+				log.Warn("Invalid stats history request", "msg", msg["emit"][1])
+				s.histCh <- nil
+				continue // Ethstats sometime sends invalid history requests, ignore those
+			}
+			list, ok := request["list"].([]interface{})
+			if !ok {
+				log.Warn("Invalid stats history block list", "list", request["list"])
+				return
+			}
+			// Convert the block number list to an integer list
+			numbers := make([]uint64, len(list))
+			for i, num := range list {
+				n, ok := num.(float64)
+				if !ok {
+					log.Warn("Invalid stats history block number", "number", num)
+					return
+				}
+				numbers[i] = uint64(n)
+			}
+			select {
+			case s.histCh <- numbers:
+				continue
+			default:
+			}
+		}
+		// Report anything else and continue
+		log.Info("Unknown stats message", "msg", msg)
+	}
+}
+ 
+// nodeInfo is the collection of metainformation about a node that is displayed
+// on the monitoring page.
+type nodeInfo struct {
+	Name     string `json:"name"`
+	Node     string `json:"node"`
+	Port     int    `json:"port"`
+	Network  string `json:"net"`
+	Protocol string `json:"protocol"`
+	API      string `json:"api"`
+	Os       string `json:"os"`
+	OsVer    string `json:"os_v"`
+	Client   string `json:"client"`
+	History  bool   `json:"canUpdateHistory"`
+}
+ 
+// authMsg is the authentication infos needed to login to a monitoring server.
+type authMsg struct {
+	ID     string   `json:"id"`
+	Info   nodeInfo `json:"info"`
+	Secret string   `json:"secret"`
+}
+ 
+// login tries to authorize the client at the remote server.
+func (s *Service) login(conn *websocket.Conn) error {
+	// Construct and send the login authentication
+	infos := s.server.NodeInfo()
+ 
+	var network, protocol string
+	if info := infos.Protocols["eth"]; info != nil {
+		network = fmt.Sprintf("%d", info.(*eth.NodeInfo).Network)
+		protocol = fmt.Sprintf("eth/%d", eth.ProtocolVersions[0])
+	} else {
+		network = fmt.Sprintf("%d", infos.Protocols["les"].(*les.NodeInfo).Network)
+		protocol = fmt.Sprintf("les/%d", les.ClientProtocolVersions[0])
+	}
+	auth := &authMsg{
+		ID: s.node,
+		Info: nodeInfo{
+			Name:     s.node,
+			Node:     infos.Name,
+			Port:     infos.Ports.Listener,
+			Network:  network,
+			Protocol: protocol,
+			API:      "No",
+			Os:       runtime.GOOS,
+			OsVer:    runtime.GOARCH,
+			Client:   "0.1.1",
+			History:  true,
+		},
+		Secret: s.pass,
+	}
+	login := map[string][]interface{}{
+		"emit": {"hello", auth},
+	}
+	if err := websocket.JSON.Send(conn, login); err != nil {
+		return err
+	}
+	// Retrieve the remote ack or connection termination
+	var ack map[string][]string
+	if err := websocket.JSON.Receive(conn, &ack); err != nil || len(ack["emit"]) != 1 || ack["emit"][0] != "ready" {
+		return errors.New("unauthorized")
+	}
+	return nil
+}
+ 
+// report collects all possible data to report and send it to the stats server.
+// This should only be used on reconnects or rarely to avoid overloading the
+// server. Use the individual methods for reporting subscribed events.
+func (s *Service) report(conn *websocket.Conn) error {
+	if err := s.reportLatency(conn); err != nil {
+		return err
+	}
+	if err := s.reportBlock(conn, nil); err != nil {
+		return err
+	}
+	if err := s.reportPending(conn); err != nil {
+		return err
+	}
+	if err := s.reportStats(conn); err != nil {
+		return err
+	}
+	return nil
+}
+ 
+// reportLatency sends a ping request to the server, measures the RTT time and
+// finally sends a latency update.
+func (s *Service) reportLatency(conn *websocket.Conn) error {
+	// Send the current time to the ethstats server
+	start := time.Now()
+ 
+	ping := map[string][]interface{}{
+		"emit": {"node-ping", map[string]string{
+			"id":         s.node,
+			"clientTime": start.String(),
+		}},
+	}
+	if err := websocket.JSON.Send(conn, ping); err != nil {
+		return err
+	}
+	// Wait for the pong request to arrive back
+	select {
+	case <-s.pongCh:
+		// Pong delivered, report the latency
+	case <-time.After(5 * time.Second):
+		// Ping timeout, abort
+		return errors.New("ping timed out")
+	}
+	latency := strconv.Itoa(int((time.Since(start) / time.Duration(2)).Nanoseconds() / 1000000))
+ 
+	// Send back the measured latency
+	log.Trace("Sending measured latency to ethstats", "latency", latency)
+ 
+	stats := map[string][]interface{}{
+		"emit": {"latency", map[string]string{
+			"id":      s.node,
+			"latency": latency,
+		}},
+	}
+	return websocket.JSON.Send(conn, stats)
+}
+ 
+// blockStats is the information to report about individual blocks.
+type blockStats struct {
+	Number     *big.Int       `json:"number"`
+	Hash       common.Hash    `json:"hash"`
+	ParentHash common.Hash    `json:"parentHash"`
+	Timestamp  *big.Int       `json:"timestamp"`
+	Miner      common.Address `json:"miner"`
+	GasUsed    uint64         `json:"gasUsed"`
+	GasLimit   uint64         `json:"gasLimit"`
+	Diff       string         `json:"difficulty"`
+	TotalDiff  string         `json:"totalDifficulty"`
+	Txs        []txStats      `json:"transactions"`
+	TxHash     common.Hash    `json:"transactionsRoot"`
+	Root       common.Hash    `json:"stateRoot"`
+	Uncles     uncleStats     `json:"uncles"`
+}
+ 
+// txStats is the information to report about individual transactions.
+type txStats struct {
+	Hash common.Hash `json:"hash"`
+}
+ 
+// uncleStats is a custom wrapper around an uncle array to force serializing
+// empty arrays instead of returning null for them.
+type uncleStats []*types.Header
+ 
+func (s uncleStats) MarshalJSON() ([]byte, error) {
+	if uncles := ([]*types.Header)(s); len(uncles) > 0 {
+		return json.Marshal(uncles)
+	}
+	return []byte("[]"), nil
+}
+ 
+// reportBlock retrieves the current chain head and reports it to the stats server.
+func (s *Service) reportBlock(conn *websocket.Conn, block *types.Block) error {
+	// Gather the block details from the header or block chain
+	details := s.assembleBlockStats(block)
+ 
+	// Assemble the block report and send it to the server
+	log.Trace("Sending new block to ethstats", "number", details.Number, "hash", details.Hash)
+ 
+	stats := map[string]interface{}{
+		"id":    s.node,
+		"block": details,
+	}
+	report := map[string][]interface{}{
+		"emit": {"block", stats},
+	}
+	return websocket.JSON.Send(conn, report)
+}
+ 
+// assembleBlockStats retrieves any required metadata to report a single block
+// and assembles the block stats. If block is nil, the current head is processed.
+func (s *Service) assembleBlockStats(block *types.Block) *blockStats {
+	// Gather the block infos from the local blockchain
+	var (
+		header *types.Header
+		td     *big.Int
+		txs    []txStats
+		uncles []*types.Header
+	)
+	if s.eth != nil {
+		// Full nodes have all needed information available
+		if block == nil {
+			block = s.eth.BlockChain().CurrentBlock()
+		}
+		header = block.Header()
+		td = s.eth.BlockChain().GetTd(header.Hash(), header.Number.Uint64())
+ 
+		txs = make([]txStats, len(block.Transactions()))
+		for i, tx := range block.Transactions() {
+			txs[i].Hash = tx.Hash()
+		}
+		uncles = block.Uncles()
+	} else {
+		// Light nodes would need on-demand lookups for transactions/uncles, skip
+		if block != nil {
+			header = block.Header()
+		} else {
+			header = s.les.BlockChain().CurrentHeader()
+		}
+		td = s.les.BlockChain().GetTd(header.Hash(), header.Number.Uint64())
+		txs = []txStats{}
+	}
+	// Assemble and return the block stats
+	author, _ := s.engine.Author(header)
+ 
+	return &blockStats{
+		Number:     header.Number,
+		Hash:       header.Hash(),
+		ParentHash: header.ParentHash,
+		Timestamp:  header.Time,
+		Miner:      author,
+		GasUsed:    header.GasUsed,
+		GasLimit:   header.GasLimit,
+		Diff:       header.Difficulty.String(),
+		TotalDiff:  td.String(),
+		Txs:        txs,
+		TxHash:     header.TxHash,
+		Root:       header.Root,
+		Uncles:     uncles,
+	}
+}
+ 
+// reportHistory retrieves the most recent batch of blocks and reports it to the
+// stats server.
+func (s *Service) reportHistory(conn *websocket.Conn, list []uint64) error {
+	// Figure out the indexes that need reporting
+	indexes := make([]uint64, 0, historyUpdateRange)
+	if len(list) > 0 {
+		// Specific indexes requested, send them back in particular
+		indexes = append(indexes, list...)
+	} else {
+		// No indexes requested, send back the top ones
+		var head int64
+		if s.eth != nil {
+			head = s.eth.BlockChain().CurrentHeader().Number.Int64()
+		} else {
+			head = s.les.BlockChain().CurrentHeader().Number.Int64()
+		}
+		start := head - historyUpdateRange + 1
+		if start < 0 {
+			start = 0
+		}
+		for i := uint64(start); i <= uint64(head); i++ {
+			indexes = append(indexes, i)
+		}
+	}
+	// Gather the batch of blocks to report
+	history := make([]*blockStats, len(indexes))
+	for i, number := range indexes {
+		// Retrieve the next block if it's known to us
+		var block *types.Block
+		if s.eth != nil {
+			block = s.eth.BlockChain().GetBlockByNumber(number)
+		} else {
+			if header := s.les.BlockChain().GetHeaderByNumber(number); header != nil {
+				block = types.NewBlockWithHeader(header)
+			}
+		}
+		// If we do have the block, add to the history and continue
+		if block != nil {
+			history[len(history)-1-i] = s.assembleBlockStats(block)
+			continue
+		}
+		// Ran out of blocks, cut the report short and send
+		history = history[len(history)-i:]
+		break
+	}
+	// Assemble the history report and send it to the server
+	if len(history) > 0 {
+		log.Trace("Sending historical blocks to ethstats", "first", history[0].Number, "last", history[len(history)-1].Number)
+	} else {
+		log.Trace("No history to send to stats server")
+	}
+	stats := map[string]interface{}{
+		"id":      s.node,
+		"history": history,
+	}
+	report := map[string][]interface{}{
+		"emit": {"history", stats},
+	}
+	return websocket.JSON.Send(conn, report)
+}
+ 
+// pendStats is the information to report about pending transactions.
+type pendStats struct {
+	Pending int `json:"pending"`
+}
+ 
+// reportPending retrieves the current number of pending transactions and reports
+// it to the stats server.
+func (s *Service) reportPending(conn *websocket.Conn) error {
+	// Retrieve the pending count from the local blockchain
+	var pending int
+	if s.eth != nil {
+		pending, _ = s.eth.TxPool().Stats()
+	} else {
+		pending = s.les.TxPool().Stats()
+	}
+	// Assemble the transaction stats and send it to the server
+	log.Trace("Sending pending transactions to ethstats", "count", pending)
+ 
+	stats := map[string]interface{}{
+		"id": s.node,
+		"stats": &pendStats{
+			Pending: pending,
+		},
+	}
+	report := map[string][]interface{}{
+		"emit": {"pending", stats},
+	}
+	return websocket.JSON.Send(conn, report)
+}
+ 
+// nodeStats is the information to report about the local node.
+type nodeStats struct {
+	Active   bool `json:"active"`
+	Syncing  bool `json:"syncing"`
+	Mining   bool `json:"mining"`
+	Hashrate int  `json:"hashrate"`
+	Peers    int  `json:"peers"`
+	GasPrice int  `json:"gasPrice"`
+	Uptime   int  `json:"uptime"`
+}
+ 
+// reportPending retrieves various stats about the node at the networking and
+// mining layer and reports it to the stats server.
+func (s *Service) reportStats(conn *websocket.Conn) error {
+	// Gather the syncing and mining infos from the local miner instance
+	var (
+		mining   bool
+		hashrate int
+		syncing  bool
+		gasprice int
+	)
+	if s.eth != nil {
+		mining = s.eth.Miner().Mining()
+		hashrate = int(s.eth.Miner().HashRate())
+ 
+		sync := s.eth.Downloader().Progress()
+		syncing = s.eth.BlockChain().CurrentHeader().Number.Uint64() >= sync.HighestBlock
+ 
+		price, _ := s.eth.APIBackend.SuggestPrice(context.Background())
+		gasprice = int(price.Uint64())
+	} else {
+		sync := s.les.Downloader().Progress()
+		syncing = s.les.BlockChain().CurrentHeader().Number.Uint64() >= sync.HighestBlock
+	}
+	// Assemble the node stats and send it to the server
+	log.Trace("Sending node details to ethstats")
+ 
+	stats := map[string]interface{}{
+		"id": s.node,
+		"stats": &nodeStats{
+			Active:   true,
+			Mining:   mining,
+			Hashrate: hashrate,
+			Peers:    s.server.PeerCount(),
+			GasPrice: gasprice,
+			Syncing:  syncing,
+			Uptime:   100,
+		},
+	}
+	report := map[string][]interface{}{
+		"emit": {"stats", stats},
+	}
+	return websocket.JSON.Send(conn, report)
+}
+
+# Environment variables available to all jobs and steps in this workflow
+env:
+  APP_LOCATION: "/" # location of your client code
+  API_LOCATION: "api" # location of your api source code - optional
+  APP_ARTIFACT_LOCATION: "build" # location of client code build output
+  AZURE_STATIC_WEB_APPS_API_TOKEN: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }} # secret containing deployment token for your static web app
+
+jobs:
+  build_and_deploy_job:
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
+    runs-on: ubuntu-latest
+    name: Build and Deploy Job
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          submodules: true
+      - name: Build And Deploy
+        id: builddeploy
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ env.AZURE_STATIC_WEB_APPS_API_TOKEN }} # secret containing api token for app
+          repo_token: ${{ secrets.GITHUB_TOKEN }} # Used for Github integrations (i.e. PR comments)
+          action: "upload"
+          ###### Repository/Build Configurations - These values can be configured to match you app requirements. ######
+          # For more information regarding Static Web App workflow configurations, please visit: https://aka.ms/swaworkflowconfig
+          app_location: ${{ env.APP_LOCATION }}
+          api_location: ${{ env.API_LOCATION }}
+          app_artifact_location: ${{ env.APP_ARTIFACT_LOCATION }}
+          ###### End of Repository/Build Configurations ######
+
+  close_pull_request_job:
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    name: Close Pull Request Job
+    steps:
+      - name: Close Pull Request
+        id: closepullrequest
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ env.AZURE_STATIC_WEB_APPS_API_TOKEN }} # secret containing api token for app
+          action: "close"
+ เพิ่มเติม:🐑 
+- {
+  "jsonrpc": "2.0",
+  "id": "",
+  "result": {
+    "genesis": {
+      "genesis_time": "2019-04-18T05:59:26.228734998Z",
+      "chain_id": "Binance-Chain-Tigris",
+      "consensus_params": {
+        "block_size": {
+          "max_bytes": "1048576",
+          "max_gas": "-1"
+        },
+        "evidence": {
+          "max_age": "100000"
+        },
+        "validator": {
+          "pub_key_types": [
+            "ed25519"
+          ]
+        }
+      },
+      "app_hash": "",
+      "app_state": {
+        "tokens": [
+          {
+            "name": "Binance Chain Native Token",
+            "symbol": "BNB",
+            "total_supply": "20000000000000000",
+            "owner": "bnb1ultyhpw2p2ktvr68swz56570lgj2rdsadq3ym2",
+            "mintable": false
+          }
+        ],
+        "accounts": [
+          {
+            "name": "Aconcagua",
+            "address": "bnb1y888axmhzz6yjj464syfy68mkhzy9phlv8fzac",
+            "consensus_addr": ""
+          },
+          {
+            "name": "Aconcagua",
+            "address": "bnb1kdx4xkktr35j2mpxncvtsshswj5gq577me7lx4",
+            "consensus_addr": "A71E5CD078B8C5C7B1AF88BCE84DD70B0557D93E"
+          },
+          {
+            "name": "Ararat",
+            "address": "bnb15hx3frkdu7vajy2eulu80vl97vehnhyavu927v",
+            "consensus_addr": ""
+          },
+          {
+            "name": "Ararat",
+            "address": "bnb1slq53dua0nj3e6y949u4yc3erus0t68k37jcwh",
+            "consensus_addr": "B7707D9F593C62E85BB9E1A2366D12A97CD5DFF2"
+          },
+          {
+            "name": "Carrauntoohil",
+            "address": "bnb1jw9xup8arde2jzarzcs2fv49hh28uad92m4ke0",
+            "consensus_addr": ""
+          },
+          {
+            "name": "Carrauntoohil",
+            "address": "bnb139l5umk42mam3znr568gw706fwvp485kw5zks3",
+            "consensus_addr": "1175946A48EAA473868A0A6F52E6C66CCAF472EA"
+          },
+          {
+            "name": "Elbrus",
+            "address": "bnb1tpagqqqx36gq09kzw4f5a3a9sk3tq54dpl5ldn",
+            "consensus_addr": ""
+          },
+          {
+            "name": "Elbrus",
+            "address": "bnb1l8e7nvtl0jn7jps8mc9usum6t3wsdr0a736q9x",
+            "consensus_addr": "7235EF143D20FC0ABC427615D83014BB02D7C06C"
+          },
+          {
+            "name": "Everest",
+            "address": "bnb19hunw9ps8n9tkrp2j64jvheezgqmfc2eyrxd7a",
+            "consensus_addr": ""
+          },
+          {
+            "name": "Everest",
+            "address": "bnb1z79qgmv2e9xm6p24f2el0a2evxzyvnsnps0mvx",
+            "consensus_addr": "B0FBB52FF7EE93CC476DFE6B74FA1FC88584F30D"
+          },
+          {
+            "name": "Fuji",
+            "address": "bnb19klje94mnu53wj7pmrk0zmtpwgr0uz8th0fcvw",
+            "consensus_addr": ""
+          },
+          {
+            "name": "Fuji",
+            "address": "bnb1atdghwrh7wy36frauvl9mem9x4rxhe85fx33t6",
+            "consensus_addr": "A9157B3FA6EB4C1E396B9B746E95327A07DC42E5"
+          },
+          {
+            "name": "Gahinga",
+            "address": "bnb17kfuzeza2kn46yqx4twxxmlw2jk2ywp5x4gze2",
+            "consensus_addr": ""
+          },
+          {
+            "name": "Gahinga",
+            "address": "bnb1h9ymecpakr8p8lhchtah2xxx7x4xq099umclqu",
+            "consensus_addr": "71F253E6FEA9EDD4B4753F5483549FE4F0F3A21C"
+          },
+          {
+            "name": "Kita",
+            "address": "bnb13m056plt2646zse2mwxfft92xawnky4nmncxc3",
+            "consensus_addr": ""
+          },
+          {
+            "name": "Kita",
+            "address": "bnb167z5qvur7xu85q885l906dgcwmgsvm3ppdarpf",
+            "consensus_addr": "414FB3BBA216AF84C47E07D6EBAA2DCFC3563A2F"
+          },
+          {
+            "name": "Scafell",
+            "address": "bnb16k0gajcczwgymfkk0zsysjzl0sxyxdfckplxlr",
+            "consensus_addr": ""
+          },
+          {
+            "name": "Scafell",
+            "address": "bnb10fg9t982xa35ddy6v8f5y06hf9hmx6tte4xlpa",
+            "consensus_addr": "14CFCE69B645F3F88BAF08EA5B77FA521E4480F9"
+          },
+          {
+            "name": "Seoraksan",
+            "address": "bnb1xaef2agzycsww32fqyggnk5xgqxs8780vfv2kh",
+            "consensus_addr": ""
+          },
+          {
+            "name": "Seoraksan",
+            "address": "bnb1u5mvgkqt9rmj4fut60rnpqfv0a865pwnn90v9q",
+            "consensus_addr": "17B42E8F284D3CA0E420262F89CD76C749BB12C9"
+          },
+          {
+            "name": "Zugspitze",
+            "address": "bnb1jstexazk7zateuwzzwllswu4j3dsllu3dgte4m",
+            "consensus_addr": ""
+          },
+          {
+            "name": "Zugspitze",
+            "address": "bnb1aanuahm2c9z5syvwsk4792vddtp74jkme5d38l",
+            "consensus_addr": "3CD4AABABDDEB7ABFEA9618732E331077A861D2B"
+          }
+        ],
+        "dex": {},
+        "param": {
+          "fees": [
+            {
+              "type": "params/FixedFeeParams",
+              "value": {
+                "msg_type": "submit_proposal",
+                "fee": "1000000000",
+                "fee_for": 1
+              }
+            },
+            {
+              "type": "params/FixedFeeParams",
+              "value": {
+                "msg_type": "deposit",
+                "fee": "125000",
+                "fee_for": 1
+              }
+            },
+            {
+              "type": "params/FixedFeeParams",
+              "value": {
+                "msg_type": "vote",
+                "fee": "0",
+                "fee_for": 3
+              }
+            },
+            {
+              "type": "params/FixedFeeParams",
+              "value": {
+                "msg_type": "create_validator",
+                "fee": "1000000000",
+                "fee_for": 1
+              }
+            },
+            {
+              "type": "params/FixedFeeParams",
+              "value": {
+                "msg_type": "remove_validator",
+                "fee": "100000000",
+                "fee_for": 1
+              }
+            },
+            {
+              "type": "params/FixedFeeParams",
+              "value": {
+                "msg_type": "dexList",
+                "fee": "200000000000",
+                "fee_for": 2
+              }
+            },
+            {
+              "type": "params/FixedFeeParams",
+              "value": {
+                "msg_type": "orderNew",
+                "fee": "0",
+                "fee_for": 3
+              }
+            },
+            {
+              "type": "params/FixedFeeParams",
+              "value": {
+                "msg_type": "orderCancel",
+                "fee": "0",
+                "fee_for": 3
+              }
+            },
+            {
+              "type": "params/FixedFeeParams",
+              "value": {
+                "msg_type": "issueMsg",
+                "fee": "100000000000",
+                "fee_for": 2
+              }
+            },
+            {
+              "type": "params/FixedFeeParams",
+              "value": {
+                "msg_type": "mintMsg",
+                "fee": "20000000000",
+                "fee_for": 2
+              }
+            },
+            {
+              "type": "params/FixedFeeParams",
+              "value": {
+                "msg_type": "tokensBurn",
+                "fee": "100000000",
+                "fee_for": 1
+              }
+            },
+            {
+              "type": "params/FixedFeeParams",
+              "value": {
+                "msg_type": "tokensFreeze",
+                "fee": "1000000",
+                "fee_for": 1
+              }
+            },
+            {
+              "type": "params/TransferFeeParams",
+              "value": {
+                "fixed_fee_params": {
+                  "msg_type": "send",
+                  "fee": "62500",
+                  "fee_for": 1
+                },
+                "multi_transfer_fee": "50000",
+                "lower_limit_as_multi": "2"
+              }
+            },
+            {
+              "type": "params/DexFeeParam",
+              "value": {
+                "dex_fee_fields": [
+                  {
+                    "fee_name": "ExpireFee",
+                    "fee_value": "50000"
+                  },
+                  {
+                    "fee_name": "ExpireFeeNative",
+                    "fee_value": "10000"
+                  },
+                  {
+                    "fee_name": "CancelFee",
+                    "fee_value": "50000"
+                  },
+                  {
+                    "fee_name": "CancelFeeNative",
+                    "fee_value": "10000"
+                  },
+                  {
+                    "fee_name": "FeeRate",
+                    "fee_value": "1000"
+                  },
+                  {
+                    "fee_name": "FeeRateNative",
+                    "fee_value": "400"
+                  },
+                  {
+                    "fee_name": "IOCExpireFee",
+                    "fee_value": "25000"
+                  },
+                  {
+                    "fee_name": "IOCExpireFeeNative",
+                    "fee_value": "5000"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "stake": {
+          "pool": {
+            "loose_tokens": "20000000000000000",
+            "bonded_tokens": "0"
+          },
+          "params": {
+            "unbonding_time": "604800000000000",
+            "max_validators": 21,
+            "bond_denom": "BNB"
+          },
+          "validators": null,
+          "bonds": null
+        },
+        "gov": {
+          "starting_proposalID": "1",
+          "deposit_params": {
+            "min_deposit": [
+              {
+                "denom": "BNB",
+                "amount": "100000000000"
+              }
+            ],
+            "max_deposit_period": "172800000000000"
+          },
+          "tally_params": {
+            "quorum": "50000000",
+            "threshold": "50000000",
+            "veto": "33400000"
+          }
+        },
+        "gentxs": [
+          {
+            "type": "auth/StdTx",
+            "value": {
+              "msg": [
+                {
+                  "type": "cosmos-sdk/MsgCreateValidatorProposal",
+                  "value": {
+                    "MsgCreateValidator": {
+                      "Description": {
+                        "moniker": "Aconcagua",
+                        "identity": "",
+                        "website": "",
+                        "details": ""
+                      },
+                      "Commission": {
+                        "rate": "0",
+                        "max_rate": "0",
+                        "max_change_rate": "0"
+                      },
+                      "delegator_address": "bnb1y888axmhzz6yjj464syfy68mkhzy9phlv8fzac",
+                      "validator_address": "bva1kdx4xkktr35j2mpxncvtsshswj5gq577m9l0c3",
+                      "pubkey": {
+                        "type": "tendermint/PubKeyEd25519",
+                        "value": "Xj/NowvRnUXEtzaI2jXn2h/OfGhZssHyDtUgLSQUTj4="
+                      },
+                      "delegation": {
+                        "denom": "BNB",
+                        "amount": "1000000000000"
+                      }
+                    },
+                    "proposal_id": "0"
+                  }
+                }
+              ],
+              "signatures": [
+                {
+                  "pub_key": {
+                    "type": "tendermint/PubKeySecp256k1",
+                    "value": "AoeLfC96urAqZtAxg7cCSXh/+tRxGMthLbvXFu/w9nO0"
+                  },
+                  "signature": "b0wYwS7fJcpg0TerEoH22T1CqcZMc3NHm0BusK/+LPMPtqHQuOkbIlPUM12r1iXJjKZhPM/ItFveKIo1oFtfUg==",
+                  "account_number": "0",
+                  "sequence": "0"
+                },
+                {
+                  "pub_key": {
+                    "type": "tendermint/PubKeySecp256k1",
+                    "value": "AreZUwAj6OlZI+xHZm66K4Nj5G/eNei768x77fdFz1fc"
+                  },
+                  "signature": "GefEmRyOFk5jGpIZnaGNAOubzPn+wedg62mf8m8yV5cWK7+SByBCcCTHQ+7kB+mkMjOR1AIuXC7Xfou5Q/QhgQ==",
+                  "account_number": "0",
+                  "sequence": "0"
+                }
+              ],
+              "memo": "",
+              "source": "0",
+              "data": null
+            }
+          },
+          {
+            "type": "auth/StdTx",
+            "value": {
+              "msg": [
+                {
+                  "type": "cosmos-sdk/MsgCreateValidatorProposal",
+                  "value": {
+                    "MsgCreateValidator": {
+                      "Description": {
+                        "moniker": "Ararat",
+                        "identity": "",
+                        "website": "",
+                        "details": ""
+                      },
+                      "Commission": {
+                        "rate": "0",
+                        "max_rate": "0",
+                        "max_change_rate": "0"
+                      },
+                      "delegator_address": "bnb15hx3frkdu7vajy2eulu80vl97vehnhyavu927v",
+                      "validator_address": "bva1slq53dua0nj3e6y949u4yc3erus0t68k3zngsn",
+                      "pubkey": {
+                        "type": "tendermint/PubKeyEd25519",
+                        "value": "cfLXuOwci5mmU0KbARjNIB95T0CdD+pNZbG2YvKwAGM="
+                      },
+                      "delegation": {
+                        "denom": "BNB",
+                        "amount": "1000000000000"
+                      }
+                    },
+                    "proposal_id": "0"
+                  }
+                }
+              ],
+              "signatures": [
+                {
+                  "pub_key": {
+                    "type": "tendermint/PubKeySecp256k1",
+                    "value": "Akr730PfaqtT0SKSy6LSPMeJwZ1xMpZs79e7LeSVnHnN"
+                  },
+                  "signature": "pZTynPBRN+W0kDlgTK88NazxXoGK5YpLqGUKrhhDqB16f//hr1/zWQdgYxv0LcA+vtW+UF78aVx/dXi0SQEHyw==",
+                  "account_number": "0",
+                  "sequence": "0"
+                },
+                {
+                  "pub_key": {
+                    "type": "tendermint/PubKeySecp256k1",
+                    "value": "Ap2OZ7JzK6o7+uIgcxpXwex+DyZfewmyWi6W4l+/jAD4"
+                  },
+                  "signature": "usP5kTrOrFGvK5adragmBqdGusM+of5GmFL+PUUG//0MLT6Ark6tvVESoCCuOvYxjP0zdHcLh+DagNucw1sQQQ==",
+                  "account_number": "0",
+                  "sequence": "0"
+                }
+              ],
+              "memo": "",
+              "source": "0",
+              "data": null
+            }
+          },
+          {
+            "type": "auth/StdTx",
+            "value": {
+              "msg": [
+                {
+                  "type": "cosmos-sdk/MsgCreateValidatorProposal",
+                  "value": {
+                    "MsgCreateValidator": {
+                      "Description": {
+                        "moniker": "Carrauntoohil",
+                        "identity": "",
+                        "website": "",
+                        "details": ""
+                      },
+                      "Commission": {
+                        "rate": "0",
+                        "max_rate": "0",
+                        "max_change_rate": "0"
+                      },
+                      "delegator_address": "bnb1jw9xup8arde2jzarzcs2fv49hh28uad92m4ke0",
+                      "validator_address": "bva139l5umk42mam3znr568gw706fwvp485kwgrxw4",
+                      "pubkey": {
+                        "type": "tendermint/PubKeyEd25519",
+                        "value": "03adih94tMF6ll96MNQYH6u9H5afRtPI6Dta1IRUIdg="
+                      },
+                      "delegation": {
+                        "denom": "BNB",
+                        "amount": "1000000000000"
+                      }
+                    },
+                    "proposal_id": "0"
+                  }
+                }
+              ],
+              "signatures": [
+                {
+                  "pub_key": {
+                    "type": "tendermint/PubKeySecp256k1",
+                    "value": "A5YeM0SMZacFSpOLDJVpJ8ovJBE2GiZhHFYMhCaVAzjT"
+                  },
+                  "signature": "5J9/MSE7tPXUP0pPlz21WOxjQn0rmIwZUzHFXj8+2VQ1qY3q8hGrIUTi8siNXV1G7gh8BzF828ljIRIWxWMzpw==",
+                  "account_number": "0",
+                  "sequence": "0"
+                },
+                {
+                  "pub_key": {
+                    "type": "tendermint/PubKeySecp256k1",
+                    "value": "A+xavrLLttWguYDOutmEv6WmrBmaaqHA68zM6gzzlIgx"
+                  },
+                  "signature": "EL5Jky6T3eF4ujHwyYJUpeE+ceL8ha1J+P9QSCwdZZtCobb4FeKhLDx+K0td7sf27DRJ64GK5+C/7yCi+JQMdQ==",
+                  "account_number": "0",
+                  "sequence": "0"
+                }
+              ],
+              "memo": "",
+              "source": "0",
+              "data": null
+            }
+          },
+          {
+            "type": "auth/StdTx",
+            "value": {
+              "msg": [
+                {
+                  "type": "cosmos-sdk/MsgCreateValidatorProposal",
+                  "value": {
+                    "MsgCreateValidator": {
+                      "Description": {
+                        "moniker": "Elbrus",
+                        "identity": "",
+                        "website": "",
+                        "details": ""
+                      },
+                      "Commission": {
+                        "rate": "0",
+                        "max_rate": "0",
+                        "max_change_rate": "0"
+                      },
+                      "delegator_address": "bnb1tpagqqqx36gq09kzw4f5a3a9sk3tq54dpl5ldn",
+                      "validator_address": "bva1l8e7nvtl0jn7jps8mc9usum6t3wsdr0a7dmsmz",
+                      "pubkey": {
+                        "type": "tendermint/PubKeyEd25519",
+                        "value": "6B03l+BUTDpxjh8F8Pt4IhLiSOeEwahRvofneuDbIw4="
+                      },
+                      "delegation": {
+                        "denom": "BNB",
+                        "amount": "1000000000000"
+                      }
+                    },
+                    "proposal_id": "0"
+                  }
+                }
+              ],
+              "signatures": [
+                {
+                  "pub_key": {
+                    "type": "tendermint/PubKeySecp256k1",
+                    "value": "Ahn7MRUZfNKd9Y7FyB1jSn1vC+VMpmnOwq4I+bK7XM4j"
+                  },
+                  "signature": "OzRMZ/u5F28DLRjyCQh4eBZ8dDGTiSh3A+Np6Is0sv1fBD8OgdfLi9nwBYjYGS+7cAlIMiUlOhDuijPU+HkaPw==",
+                  "account_number": "0",
+                  "sequence": "0"
+                },
+                {
+                  "pub_key": {
+                    "type": "tendermint/PubKeySecp256k1",
+                    "value": "AkPSe1gjEdCmb+KiRFXkArA4DDlmcUor6AS45tc4Lpe9"
+                  },
+                  "signature": "ocQajxzhcQ0Cge7yzuD2nwqw8htkuQ/qjWisskpwZdZNnfUHnqgO1VfIdG5lI+DHNyIEs7MfyoRi+ir8QG6xyw==",
+                  "account_number": "0",
+                  "sequence": "0"
+                }
+              ],
+              "memo": "",
+              "source": "0",
+              "data": null
+            }
+          },
+          {
+            "type": "auth/StdTx",
+            "value": {
+              "msg": [
+                {
+                  "type": "cosmos-sdk/MsgCreateValidatorProposal",
+                  "value": {
+                    "MsgCreateValidator": {
+                      "Description": {
+                        "moniker": "Everest",
+                        "identity": "",
+                        "website": "",
+                        "details": ""
+                      },
+                      "Commission": {
+                        "rate": "0",
+                        "max_rate": "0",
+                        "max_change_rate": "0"
+                      },
+                      "delegator_address": "bnb19hunw9ps8n9tkrp2j64jvheezgqmfc2eyrxd7a",
+                      "validator_address": "bva1z79qgmv2e9xm6p24f2el0a2evxzyvnsnpvwtjz",
+                      "pubkey": {
+                        "type": "tendermint/PubKeyEd25519",
+                        "value": "DJEOL+ZQ5OAUBrMxC0iftgqEvD/1xb7jpW1YmLaorzI="
+                      },
+                      "delegation": {
+                        "denom": "BNB",
+                        "amount": "1000000000000"
+                      }
+                    },
+                    "proposal_id": "0"
+                  }
+                }
+              ],
+              "signatures": [
+                {
+                  "pub_key": {
+                    "type": "tendermint/PubKeySecp256k1",
+                    "value": "Am/wetIQSzI5tGJ24D6dOxn9sAwRj8w36DSYPmu6caKv"
+                  },
+                  "signature": "UI24Ax8YAHTUBBnJnAtLnrYRs878X2fa8n995/jx+s0LP1la39Z7pKrmAprLj8z675NGlTEeewOPlF8pfJMErg==",
+                  "account_number": "0",
+                  "sequence": "0"
+                },
+                {
+                  "pub_key": {
+                    "type": "tendermint/PubKeySecp256k1",
+                    "value": "As5pyeztTCpapqEEzFoF66hiDLACFIxB3g6/PrcG+hyQ"
+                  },
+                  "signature": "iAMofKNSVgorz7qTdU5DCgmGyLiapE2m4CX83pACv3dy1kLNUW7tZSYz4N5S07WnC683dl2pLFHkonQ1PYpAzQ==",
+                  "account_number": "0",
+                  "sequence": "0"
+                }
+              ],
+              "memo": "",
+              "source": "0",
+              "data": null
+            }
+          },
+          {
+            "type": "auth/StdTx",
+            "value": {
+              "msg": [
+                {
+                  "type": "cosmos-sdk/MsgCreateValidatorProposal",
+                  "value": {
+                    "MsgCreateValidator": {
+                      "Description": {
+                        "moniker": "Fuji",
+                        "identity": "",
+                        "website": "",
+                        "details": ""
+                      },
+                      "Commission": {
+                        "rate": "0",
+                        "max_rate": "0",
+                        "max_change_rate": "0"
+                      },
+                      "delegator_address": "bnb19klje94mnu53wj7pmrk0zmtpwgr0uz8th0fcvw",
+                      "validator_address": "bva1atdghwrh7wy36frauvl9mem9x4rxhe85f6sp47",
+                      "pubkey": {
+                        "type": "tendermint/PubKeyEd25519",
+                        "value": "sGpZotdb9dAU/OfJmbXnHnqWCHD3JYR9S6MjW66qCO8="
+                      },
+                      "delegation": {
+                        "denom": "BNB",
+                        "amount": "1000000000000"
+                      }
+                    },
+                    "proposal_id": "0"
+                  }
+                }
+              ],
+              "signatures": [
+                {
+                  "pub_key": {
+                    "type": "tendermint/PubKeySecp256k1",
+                    "value": "A0OfHJt5TyR/e6+qpcXgJMQ1+G896gFbrWvYQIkKUR4k"
+                  },
+                  "signature": "HGWUXPTCd+f1Oj/8TXQehp7GxAe/ACccMwa1BmIeKFJQkUrZ1VmJ26SdAtQIyG6GGSfIvFMNSqHMl7UMIW5SlA==",
+                  "account_number": "0",
+                  "sequence": "0"
+                },
+                {
+                  "pub_key": {
+                    "type": "tendermint/PubKeySecp256k1",
+                    "value": "AnLQak9lXNvW2PhhOrc3BBt0S842rk3+B7fajT+E+iBo"
+                  },
+                  "signature": "wyyGoLsd1TkzEPjuosGsQ5DYTJSTcYGwLU50GELNJpgjiAPxpawk0CC3cnop76JP6vSSh2Oo926WkV3v+JojYg==",
+                  "account_number": "0",
+                  "sequence": "0"
+                }
+              ],
+              "memo": "",
+              "source": "0",
+              "data": null
+            }
+          },
+          {
+            "type": "auth/StdTx",
+            "value": {
+              "msg": [
+                {
+                  "type": "cosmos-sdk/MsgCreateValidatorProposal",
+                  "value": {
+                    "MsgCreateValidator": {
+                      "Description": {
+                        "moniker": "Gahinga",
+                        "identity": "",
+                        "website": "",
+                        "details": ""
+                      },
+                      "Commission": {
+                        "rate": "0",
+                        "max_rate": "0",
+                        "max_change_rate": "0"
+                      },
+                      "delegator_address": "bnb17kfuzeza2kn46yqx4twxxmlw2jk2ywp5x4gze2",
+                      "validator_address": "bva1h9ymecpakr8p8lhchtah2xxx7x4xq099u8e07c",
+                      "pubkey": {
+                        "type": "tendermint/PubKeyEd25519",
+                        "value": "A1PGOfgMyAFZRENtqxAyJF1E+RLtwx72aP+fSkXNBZk="
+                      },
+                      "delegation": {
+                        "denom": "BNB",
+                        "amount": "1000000000000"
+                      }
+                    },
+                    "proposal_id": "0"
+                  }
+                }
+              ],
+              "signatures": [
+                {
+                  "pub_key": {
+                    "type": "tendermint/PubKeySecp256k1",
+                    "value": "AzW1smD8iikhtvEzgYtG3D9RNv2LkLHoMCJa94cVOaRI"
+                  },
+                  "signature": "O67Zv+21h+gpRQKirHTZNHMqzxGIAS2xsqpz8j5C5opNSb+LVdOrwXTMtQZusjwUH7WbwnblB9AJXAnUfltQgA==",
+                  "account_number": "0",
+                  "sequence": "0"
+                },
+                {
+                  "pub_key": {
+                    "type": "tendermint/PubKeySecp256k1",
+                    "value": "AmNNSL/gDALBP6wFmnsohrwIU3Hr/ATTWYo5DRxGEHf1"
+                  },
+                  "signature": "1a3drH17u1zo7EaRcusuAZNFjmAD3FGPc7RPV7j/YO87TZRqAPB+QCzBEqBuYKJqJjdV1pRcHFLMwJW3pTzaoQ==",
+                  "account_number": "0",
+                  "sequence": "0"
+                }
+              ],
+              "memo": "",
+              "source": "0",
+              "data": null
+            }
+          },
+          {
+            "type": "auth/StdTx",
+            "value": {
+              "msg": [
+                {
+                  "type": "cosmos-sdk/MsgCreateValidatorProposal",
+                  "value": {
+                    "MsgCreateValidator": {
+                      "Description": {
+                        "moniker": "Kita",
+                        "identity": "",
+                        "website": "",
+                        "details": ""
+                      },
+                      "Commission": {
+                        "rate": "0",
+                        "max_rate": "0",
+                        "max_change_rate": "0"
+                      },
+                      "delegator_address": "bnb13m056plt2646zse2mwxfft92xawnky4nmncxc3",
+                      "validator_address": "bva167z5qvur7xu85q885l906dgcwmgsvm3pp3unld",
+                      "pubkey": {
+                        "type": "tendermint/PubKeyEd25519",
+                        "value": "lEbRSthsjS10eAsIRxEAAaHC4lLu3+pHU+u7/OOiL1I="
+                      },
+                      "delegation": {
+                        "denom": "BNB",
+                        "amount": "1000000000000"
+                      }
+                    },
+                    "proposal_id": "0"
+                  }
+                }
+              ],
+              "signatures": [
+                {
+                  "pub_key": {
+                    "type": "tendermint/PubKeySecp256k1",
+                    "value": "AouWnV2LmPlF0LWz/+7co0Qt5whIIQOfyj7N1K8j3XVv"
+                  },
+                  "signature": "vZUVfPGEJEi966N8IPBm2Q1a+eMjp/VXKoQTlOm6r1h2ksw44Rt3M9If/O8tlDkWrHNJFa/gKCIFMEyVctuV+A==",
+                  "account_number": "0",
+                  "sequence": "0"
+                },
+                {
+                  "pub_key": {
+                    "type": "tendermint/PubKeySecp256k1",
+                    "value": "A9Y5dz1pmP75kb2AvqsrAy02SdN6v3X/5az9SoaB0lnk"
+                  },
+                  "signature": "21G47QHSs6b0fIWMSLXwssut+VFMqK2i+W1gfJj6Rxo/OZBKBxjcWknQG4oUYt7pLp2NMnIBR2jJ63a3Ov0RTw==",
+                  "account_number": "0",
+                  "sequence": "0"
+                }
+              ],
+              "memo": "",
+              "source": "0",
+              "data": null
+            }
+          },
+          {
+            "type": "auth/StdTx",
+            "value": {
+              "msg": [
+                {
+                  "type": "cosmos-sdk/MsgCreateValidatorProposal",
+                  "value": {
+                    "MsgCreateValidator": {
+                      "Description": {
+                        "moniker": "Scafell",
+                        "identity": "",
+                        "website": "",
+                        "details": ""
+                      },
+                      "Commission": {
+                        "rate": "0",
+                        "max_rate": "0",
+                        "max_change_rate": "0"
+                      },
+                      "delegator_address": "bnb16k0gajcczwgymfkk0zsysjzl0sxyxdfckplxlr",
+                      "validator_address": "bva10fg9t982xa35ddy6v8f5y06hf9hmx6ttef80le",
+                      "pubkey": {
+                        "type": "tendermint/PubKeyEd25519",
+                        "value": "K6ToFUL0N7euH4o13bIzx4mo3CJzQ3fZttY68cpAO2E="
+                      },
+                      "delegation": {
+                        "denom": "BNB",
+                        "amount": "1000000000000"
+                      }
+                    },
+                    "proposal_id": "0"
+                  }
+                }
+              ],
+              "signatures": [
+                {
+                  "pub_key": {
+                    "type": "tendermint/PubKeySecp256k1",
+                    "value": "A5JwWw9dUTx5ptcMX1xT0IiTBuI+BRAx+b/qHuJeDHaY"
+                  },
+                  "signature": "bEqho76PsinsQi+cG9wTka4YjeWzpxuuhIOBOxf0P55Q5MsUuSM+i3uGUSvh8DQZLEZ4QCu1PuPkJE69IjJJVA==",
+                  "account_number": "0",
+                  "sequence": "0"
+                },
+                {
+                  "pub_key": {
+                    "type": "tendermint/PubKeySecp256k1",
+                    "value": "AkIZ4rTzTCQnXID0RrJAbWbuL7/39SUpO9Yzg/DoJ2nn"
+                  },
+                  "signature": "xTbs2pScagYfryZ0gEy5BVX0PIk1aVHJaFb2ORNIASVOSyNS0R0uJrrEo2uoTNTg5/VbWjXRQ4mNp4KgoDaTMg==",
+                  "account_number": "0",
+                  "sequence": "0"
+                }
+              ],
+              "memo": "",
+              "source": "0",
+              "data": null
+            }
+          },
+          {
+            "type": "auth/StdTx",
+            "value": {
+              "msg": [
+                {
+                  "type": "cosmos-sdk/MsgCreateValidatorProposal",
+                  "value": {
+                    "MsgCreateValidator": {
+                      "Description": {
+                        "moniker": "Seoraksan",
+                        "identity": "",
+                        "website": "",
+                        "details": ""
+                      },
+                      "Commission": {
+                        "rate": "0",
+                        "max_rate": "0",
+                        "max_change_rate": "0"
+                      },
+                      "delegator_address": "bnb1xaef2agzycsww32fqyggnk5xgqxs8780vfv2kh",
+                      "validator_address": "bva1u5mvgkqt9rmj4fut60rnpqfv0a865pwnnewumy",
+                      "pubkey": {
+                        "type": "tendermint/PubKeyEd25519",
+                        "value": "342oxav9s4WVORMIu3HloeCqvcHQzzgxXVDWvpObJgY="
+                      },
+                      "delegation": {
+                        "denom": "BNB",
+                        "amount": "1000000000000"
+                      }
+                    },
+                    "proposal_id": "0"
+                  }
+                }
+              ],
+              "signatures": [
+                {
+                  "pub_key": {
+                    "type": "tendermint/PubKeySecp256k1",
+                    "value": "A4KbDaWTfv2EGahovzcunfeVSDv+yIkwnAwhVOEERZ4R"
+                  },
+                  "signature": "TGPCijFmaQyKtq2sTWSehfOfcmtq/aYyT36L83HxIZUl7BR+I0fzcIlN2NNg/rJMTZ+4rpWMkEGj6Qz/mfWsnA==",
+                  "account_number": "0",
+                  "sequence": "0"
+                },
+                {
+                  "pub_key": {
+                    "type": "tendermint/PubKeySecp256k1",
+                    "value": "AlK/+L/va2UNh+a+vJDg7jwIqssgj0g/xkbTIK0ZFJ5x"
+                  },
+                  "signature": "JKlZwpNfkoMtyUQrOpUPyPFJj08TVFSSs0xGdUXW4bU7nABgAAW+P+XpKTtp4i4XPxOsbWCPNUJnYu9EJ6Umyw==",
+                  "account_number": "0",
+                  "sequence": "0"
+                }
+              ],
+              "memo": "",
+              "source": "0",
+              "data": null
+            }
+          },
+          {
+            "type": "auth/StdTx",
+            "value": {
+              "msg": [
+                {
+                  "type": "cosmos-sdk/MsgCreateValidatorProposal",
+                  "value": {
+                    "MsgCreateValidator": {
+                      "Description": {
+                        "moniker": "Zugspitze",
+                        "identity": "",
+                        "website": "",
+                        "details": ""
+                      },
+                      "Commission": {
+                        "rate": "0",
+                        "max_rate": "0",
+                        "max_change_rate": "0"
+                      },
+                      "delegator_address": "bnb1jstexazk7zateuwzzwllswu4j3dsllu3dgte4m",
+                      "validator_address": "bva1aanuahm2c9z5syvwsk4792vddtp74jkmegvpem",
+                      "pubkey": {
+                        "type": "tendermint/PubKeyEd25519",
+                        "value": "tmGe3KQUNISAAoHWmLcMk16RUq1Xsx2FwF8vefZLOfM="
+                      },
+                      "delegation": {
+                        "denom": "BNB",
+                        "amount": "1000000000000"
+                      }
+                    },
+                    "proposal_id": "0"
+                  }
+                }
+              ],
+              "signatures": [
+                {
+                  "pub_key": {
+                    "type": "tendermint/PubKeySecp256k1",
+                    "value": "AqduvCtc3R/Urghz/SawvGlPZm54RO0qmzHKsrKjgkNw"
+                  },
+                  "signature": "LSez3TtJS3uZKb11HZ7FyLopr73FkVy4xCWuxUdJEvoE6ve9OTIqBkl5eFxHa/t1hRybVrKLcOFpHW8LpYU27A==",
+                  "account_number": "0",
+                  "sequence": "0"
+                },
+                {
+                  "pub_key": {
+                    "type": "tendermint/PubKeySecp256k1",
+                    "value": "AjFun7TuRN06G7mK3a/61Ak+0Fq5FTPs/yEelcOUFhtV"
+                  },
+                  "signature": "Sw6eEsRQKxA/rKkqT+WOCJXG6CVF38gk3jzudQ8zUo1ns3ij/Xe6HCByiUJ8cKkTq00r8hwuO8LaCp0jiIE2Og==",
+                  "account_number": "0",
+                  "sequence": "0"
+                }
+              ],
+              "memo": "",
+              "source": "0",
+              "data": null
+            }
+          }
+        ]
+      }
+    }
+  }
+}
+Taxi 🚕:
+-เปิดเมนูหลัก
+วิกิพีเดีย
+ค้นหา
+77
+คลาวด์คอมพิวติ้ง
+บทความ พูดคุย
+ภาษา
+ดาวน์โหลด PDF
+Unwatch
+ประวัติศาสตร์
+แก้ไข
+เพื่อไม่ให้สับสนกับCloud Computing (ม้า)
+เรียนรู้เพิ่มเติม
+บทความนี้อาจจะทำให้เกิดความสับสนหรือไม่ชัดเจนให้กับผู้อ่าน โดยเฉพาะอย่างยิ่ง เป็นบทความที่เขียนได้ไม่ดีและมีแหล่งที่มาซึ่งเต็มไปด้วยความไม่ถูกต้องเกี่ยวกับหัวข้อที่มีรายละเอียดสูง ( มีนาคม 2564 )
+การประมวลผลแบบคลาวด์[1]คือความพร้อมใช้งานตามต้องการของทรัพยากรระบบคอมพิวเตอร์ โดยเฉพาะอย่างยิ่งการจัดเก็บข้อมูล (ที่เก็บข้อมูลบนคลาวด์ ) และพลังการประมวลผลโดยไม่มีการจัดการโดยตรงโดยผู้ใช้ [2]เมฆขนาดใหญ่มักมีฟังก์ชันกระจายไปตามสถานที่หลายแห่ง โดยแต่ละแห่งเป็นศูนย์ข้อมูล การประมวลผลแบบคลาวด์อาศัยการแบ่งปันทรัพยากรเพื่อให้เกิดความสอดคล้อง[ จำเป็นต้องมีการชี้แจง ]และการประหยัดจากขนาดโดยทั่วไปจะใช้รูปแบบ "จ่ายตามการใช้งาน" ซึ่งสามารถช่วยลดค่าใช้จ่ายด้านทุนแต่อาจนำไปสู่ค่าใช้จ่ายในการดำเนินงานที่ไม่คาดคิดสำหรับผู้ใช้ที่ไม่รู้จัก [3]
+
+
+อุปมาคลาวด์คอมพิวติ้ง: กลุ่มขององค์ประกอบเครือข่ายที่ให้บริการไม่จำเป็นต้องระบุหรือจัดการโดยผู้ใช้เป็นรายบุคคล แทน ชุดฮาร์ดแวร์และซอฟต์แวร์ที่จัดการโดยผู้ให้บริการทั้งหมดสามารถมองได้ว่าเป็นคลาวด์ที่ไม่เป็นรูปเป็นร่าง
+ข้อเสนอที่มีค่า	แก้ไข
+ผู้ให้การสนับสนุนคลาวด์สาธารณะและไฮบริดทราบว่าการประมวลผลแบบคลาวด์ช่วยให้บริษัทต่างๆ หลีกเลี่ยงหรือลดค่าใช้จ่ายด้านโครงสร้างพื้นฐานด้านไอทีล่วงหน้าได้ ผู้เสนอยังอ้างว่าการประมวลผลแบบคลาวด์ช่วยให้องค์กรต่างๆสามารถเรียกใช้แอปพลิเคชันของตนและทำงานได้เร็วขึ้น ด้วยความสามารถในการจัดการที่ดีขึ้นและการบำรุงรักษาน้อยลง และช่วยให้ทีมไอทีสามารถปรับทรัพยากรได้อย่างรวดเร็วมากขึ้นเพื่อตอบสนองความต้องการที่ผันผวนและคาดเดาไม่ได้[4] [5] [6 ]ให้ความสามารถในการคำนวณแบบต่อเนื่อง : พลังการประมวลผลสูงในช่วงเวลาที่มีความต้องการสูงสุด [7]
+
+ประวัติศาสตร์	แก้ไข
+เรียนรู้เพิ่มเติม
+ส่วนนี้อาจจะทำให้เกิดความสับสนหรือไม่ชัดเจนให้กับผู้อ่าน ( มกราคม 2021 )
+การอ้างอิงถึงวลี "การประมวลผลแบบคลาวด์" ปรากฏในปี 1996 โดยมีการกล่าวถึงครั้งแรกในเอกสารภายในของCompaq [8]
+
+สัญลักษณ์คลาวด์ถูกใช้เพื่อเป็นตัวแทนของเครือข่ายของอุปกรณ์คอมพิวเตอร์ในARPANETดั้งเดิมภายในปี 1977, [9]และCSNET ในปี 1981 [10] — ทั้งที่เป็นรุ่นก่อนของอินเทอร์เน็ตเอง คำว่าcloudถูกใช้เป็นคำอุปมาสำหรับอินเทอร์เน็ต และใช้รูปร่างเหมือนเมฆที่เป็นมาตรฐานเพื่อแสดงถึงเครือข่ายบนแผนผังโทรศัพท์ ด้วยการทำให้เข้าใจง่ายนี้ ความหมายก็คือว่าการเชื่อมต่อปลายทางของเครือข่ายเฉพาะนั้นไม่เกี่ยวข้องกับการทำความเข้าใจไดอะแกรม (11)
+
+คำว่าcloudใช้เพื่ออ้างถึงแพลตฟอร์มสำหรับการคำนวณแบบกระจายตั้งแต่ต้นปี 1993 เมื่อAppleแยกGeneral MagicและAT&Tใช้ในการอธิบาย (จับคู่) เทคโนโลยีTelescriptและ PersonaLink [12] ในWired'sเมษายน 1994 คุณลักษณะ "Bill and Andy's Excellent Adventure II" Andy Hertzfeldแสดงความคิดเห็นเกี่ยวกับ Telescript ซึ่งเป็นภาษาการเขียนโปรแกรมแบบกระจายของ General Magic:
+
+"ความงามของ Telescript ... คือตอนนี้ แทนที่จะมีอุปกรณ์สำหรับตั้งโปรแกรม ตอนนี้เรามี Cloud ทั้งหมดอยู่ที่นั่น ซึ่งโปรแกรมเดียวสามารถไปและเดินทางไปยังแหล่งข้อมูลต่างๆ มากมาย และสร้างการจัดเรียงของ บริการเสมือน ไม่เคยมีใครคิดมาก่อนเลย ตัวอย่าง จิม ไวท์ [ผู้ออกแบบ Telescript, X.400และASN.1 ] ที่ใช้ตอนนี้เป็นบริการจัดวันที่โดยที่ซอฟต์แวร์ตัวแทนไปที่ร้านดอกไม้และสั่งดอกไม้แล้ว ไปที่ร้านจำหน่ายตั๋วและรับตั๋วสำหรับการแสดง และทุกอย่างจะแจ้งให้ทั้งสองฝ่ายทราบ” [13]
+
+ประวัติศาสตร์ยุคแรก	แก้ไข
+ในช่วงทศวรรษที่ 1960 แนวความคิดเริ่มต้นของการแบ่งปันเวลาได้รับความนิยมผ่าน RJE ( Remote Job Entry ); [14]ศัพท์นี้ส่วนใหญ่จะมีความสัมพันธ์กับผู้ขายขนาดใหญ่เช่นIBMและธันวาคม โซลูชันการแชร์แบบเต็มเวลามีให้บริการในช่วงต้นทศวรรษ 1970 บนแพลตฟอร์มต่างๆ เช่น Multics (บนฮาร์ดแวร์ GE), Cambridge CTSS และพอร์ต UNIX ที่เก่าที่สุด (บนฮาร์ดแวร์ DEC) กระนั้น โมเดล "ศูนย์ข้อมูล" ที่ผู้ใช้ส่งงานไปยังโอเปอเรเตอร์เพื่อรันบนเมนเฟรมของไอบีเอ็มนั้นมีความโดดเด่นอย่างท่วมท้น
+
+ในปี 1990 บริษัทโทรคมนาคมซึ่งก่อนหน้านี้ได้เสนอวงจรข้อมูลแบบจุดต่อจุดโดยเฉพาะเป็นหลัก ได้เริ่มให้บริการเครือข่ายส่วนตัวเสมือน (VPN) ด้วยคุณภาพการบริการที่เทียบเท่ากัน แต่มีต้นทุนที่ต่ำกว่า การเปลี่ยนทราฟฟิกตามที่เห็นสมควรเพื่อให้ใช้เซิร์ฟเวอร์สมดุล พวกเขาสามารถใช้แบนด์วิดท์เครือข่ายโดยรวมได้อย่างมีประสิทธิภาพมากขึ้น [ ต้องการการอ้างอิง ] พวกเขาเริ่มใช้สัญลักษณ์คลาวด์เพื่อระบุจุดแบ่งเขตระหว่างสิ่งที่ผู้ให้บริการรับผิดชอบและสิ่งที่ผู้ใช้รับผิดชอบ Cloud Computing ขยายขอบเขตนี้เพื่อให้ครอบคลุมเซิร์ฟเวอร์ทั้งหมดเช่นเดียวกับโครงสร้างพื้นฐานเครือข่าย [15]เมื่อคอมพิวเตอร์กระจายตัวมากขึ้น นักวิทยาศาสตร์และเทคโนโลยีได้สำรวจวิธีที่จะทำให้พลังการประมวลผลขนาดใหญ่พร้อมใช้งานสำหรับผู้ใช้มากขึ้นผ่านการแบ่งปันเวลา [ ต้องการการอ้างอิง ]พวกเขาทดลองกับอัลกอริธึมเพื่อเพิ่มประสิทธิภาพโครงสร้างพื้นฐาน แพลตฟอร์ม และแอปพลิเคชัน เพื่อจัดลำดับความสำคัญของ CPU และเพิ่มประสิทธิภาพสำหรับผู้ใช้ปลายทาง [16]
+
+การใช้คำอุปมาคลาวด์สำหรับบริการเสมือนจริงนั้นเกิดขึ้นอย่างน้อยจนถึงGeneral Magicในปี 1994 ซึ่งใช้เพื่ออธิบายจักรวาลของ "สถานที่" ที่ตัวแทนมือถือในสภาพแวดล้อมTelescriptสามารถไปได้ ตามคำอธิบายโดย Andy Hertzfeld :
+
+"ความสวยงามของTelescript " Andyกล่าว"คือตอนนี้ แทนที่จะมีอุปกรณ์สำหรับตั้งโปรแกรม ตอนนี้เรามี Cloud ทั้งหมดอยู่ที่นั่น ซึ่งโปรแกรมเดียวสามารถไปและเดินทางไปยังแหล่งข้อมูลต่างๆ มากมาย และสร้าง เสมือนเป็นบริการเสมือน” [17]
+
+การใช้คำอุปมาคลาวด์นั้นให้เครดิตกับDavid Hoffmanพนักงานฝ่ายสื่อสารของ General Magic โดยอิงจากการใช้งานระบบเครือข่ายและโทรคมนาคมมาเป็นเวลานาน นอกเหนือจากการใช้งานโดย General Magic แล้ว ยังใช้ในการส่งเสริมบริการ PersonaLink ที่เกี่ยวข้องของAT&T [18]
+
+ยุค 2000	แก้ไข
+In July 2002, Amazon created subsidiary Amazon Web Services, with the goal to "enable developers to build innovative and entrepreneurial applications on their own." In March 2006 Amazon introduced its Simple Storage Service (S3), followed by Elastic Compute Cloud (EC2) in August of the same year.[19][20] These products pioneered the usage of server virtualization to deliver IaaS at a cheaper and on-demand pricing basis.
+
+In April 2008, Google released the beta version of Google App Engine.[21] The App Engine was a PaaS (one of the first of its kind) which provided fully maintained infrastructure and a deployment platform for users to create web applications using common languages/technologies such as Python, Node.js and PHP. The goal was to eliminate the need for some administrative tasks typical of an IaaS model, while creating a platform where users could easily deploy such applications and scale them to demand.[22]
+
+In early 2008, NASA's Nebula,[23] enhanced in the RESERVOIR European Commission-funded project, became the first open-source software for deploying private and hybrid clouds, and for the federation of clouds.[24]
+
+By mid-2008, Gartner saw an opportunity for cloud computing "to shape the relationship among consumers of IT services, those who use IT services and those who sell them"[25] and observed that "organizations are switching from company-owned hardware and software assets to per-use service-based models" so that the "projected shift to computing ... will result in dramatic growth in IT products in some areas and significant reductions in other areas."[26]
+
+In 2008, the U.S. National Science Foundation began the Cluster Exploratory program to fund academic research using Google-IBM cluster technology to analyze massive amounts of data.[27]
+
+In 2009, the government of France announced Project Andromède to create a "sovereign cloud" or national cloud computing, with the government to spend €285 million.[28][29] The initiative failed badly and Cloudwatt was shut down on 1 February 2020.[30][31]
+
+2010s	Edit
+In February 2010, Microsoft released Microsoft Azure, which was announced in October 2008.[32]
+
+In July 2010, Rackspace Hosting and NASA jointly launched an open-source cloud-software initiative known as OpenStack. The OpenStack project intended to help organizations offering cloud-computing services running on standard hardware. The early code came from NASA's Nebula platform as well as from Rackspace's Cloud Files platform. As an open-source offering and along with other open-source solutions such as CloudStack, Ganeti, and OpenNebula, it has attracted attention by several key communities. Several studies aim at comparing these open source offerings based on a set of criteria.[33][34][35][36][37][38][39]
+
+On March 1, 2011, IBM announced the IBM SmartCloud framework to support Smarter Planet.[40] Among the various components of the Smarter Computing foundation, cloud computing is a critical part. On June 7, 2012, Oracle announced the Oracle Cloud.[41] This cloud offering is poised to be the first to provide users with access to an integrated set of IT solutions, including the Applications (SaaS), Platform (PaaS), and Infrastructure (IaaS) layers.[42][43][44]
+
+ในเดือนพฤษภาคม 2555 Google Compute Engineได้เปิดตัวในรุ่นตัวอย่างก่อนที่จะเปิดตัวในความพร้อมใช้งานทั่วไปในเดือนธันวาคม 2556 [45]
+
+ใน 2019, Linux เป็นระบบปฏิบัติการที่ใช้กันมากที่สุดในMicrosoft Azure [46]ในเดือนธันวาคม 2019 Amazon ได้ประกาศAWS Outposts ซึ่งเป็นบริการที่มีการจัดการเต็มรูปแบบซึ่งขยายโครงสร้างพื้นฐานของ AWS, บริการของ AWS, API และเครื่องมือไปยังศูนย์ข้อมูลลูกค้า พื้นที่ co-location หรือสิ่งอำนวยความสะดวกในองค์กรอย่างแท้จริงเพื่อความสอดคล้องอย่างแท้จริง ประสบการณ์ไฮบริด[47]
+
+แนวความคิดที่คล้ายกัน	
+ลักษณะเฉพาะ	
+รูปแบบการให้บริการ	
+โมเดลการปรับใช้	
+สถาปัตยกรรม	
+ความปลอดภัยและความเป็นส่วนตัว	
+ข้อจำกัดและข้อเสีย	
+เทรนด์ที่กำลังมาแรง	
+นิติดิจิทัลในระบบคลาวด์	
+ดูสิ่งนี้ด้วย	
+อ้างอิง	
+อ่านเพิ่มเติม	
+ลิงค์ภายนอก	
+แก้ไขล่าสุดเมื่อ5 วันก่อนโดยLilyKitty
+วิกิพีเดีย
+เนื้อหามีอยู่ในCC BY-SA 3.0เว้นแต่จะระบุไว้เป็นอย่างอื่น
+นโยบายความเป็นส่วนตัว ข้อตกลงในการใช้งานเดสก์ทอป
